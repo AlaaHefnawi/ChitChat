@@ -1,0 +1,266 @@
+#!/usr/bin/env node
+
+const app = require('../app');
+const debug = require('debug')('server:server');
+const http = require('http');
+const User = require('../models/User');
+const Message = require('../models/Message'); 
+const Chat = require('../models/Chat'); 
+
+const PORT = process.env.PORT || 3002;
+app.set('port', PORT);
+
+const server = http.createServer(app);
+
+const io = require('socket.io')(server, {
+  cors: {
+    origin: '*', 
+    methods: ['GET', 'POST','PUT', 'DELETE'],
+  },
+});
+
+app.locals.io = io;
+
+const globalUsers = new Map();
+const disconnectTimers = new Map();
+
+io.on('connection', (socket) => {
+  socket.on('register', async (rawUsername) => {
+    if (!rawUsername || typeof rawUsername !== 'string') {
+    console.warn('Invalid username during register:', rawUsername);
+    return;
+  }
+    try {
+      const username = rawUsername.trim().toLowerCase();
+      socket.user = username;
+
+      const user = await User.findOneAndUpdate(
+        { name: new RegExp(`^${username}$`, 'i') },
+        { lastOnline: null, socketId: socket.id },
+        { new: true }
+      );
+
+      if (!user) {
+        console.warn(`User ${username} not found during register`);
+        return;
+      }
+
+      if (disconnectTimers.has(username)) {
+    clearTimeout(disconnectTimers.get(username));
+    disconnectTimers.delete(username);
+    console.log(`Cleared disconnect timer for ${username} (user reconnected)`);
+  }
+
+      globalUsers.set(username, socket.id);
+      socket.emit('registered');
+      io.emit('user_status', {
+        username: user.name,
+        isOnline: true,
+        lastOnline: null,
+      });
+
+      console.log(`${user.name} registered with socket ID ${socket.id}`);
+    } catch (err) {
+      console.error('Register error:', err);
+    }
+  });
+
+  socket.on('send-message', (message, target) => {
+    const targetSocketId = globalUsers.get(target.toLowerCase());
+    if (targetSocketId) {
+      socket.to(targetSocketId).emit('receive-message', message);
+    }
+  });
+
+  socket.on('typing', (targetUsername) => {
+    const targetSocketId = globalUsers.get(targetUsername.toLowerCase());
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('typing', {
+        from: socket.user,
+      });
+    }
+  });
+
+  
+
+  socket.on('stop-typing', (targetUsername) => {
+    const targetSocketId = globalUsers.get(targetUsername.toLowerCase());
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('stop-typing', {
+        from: socket.user,
+      });
+    }
+  });
+
+  socket.on('disconnect', async () => {
+    if (!socket.user) return;
+
+    const username = socket.user.trim().toLowerCase();
+    const disconnectTime = new Date();
+
+    try {
+      const user = await User.findOne({ name: new RegExp(`^${username}$`, 'i') });
+
+      if (user && user.socketId === socket.id) {
+        await User.updateOne(
+          { name: user.name },
+          { lastOnline: disconnectTime, socketId: null }
+        );
+
+        io.emit('user_status', {
+          username: user.name,
+          isOnline: false,
+          lastOnline: disconnectTime,
+        });
+
+        console.log(`${user.name} is now offline at ${disconnectTime}`);
+      }
+
+      globalUsers.delete(username);
+      console.log(`${username} removed from globalUsers`);
+    } catch (error) {
+      console.error('Disconnect error:', error);
+    }
+  });
+
+
+  socket.on('message_read', async ({ messageId }) => {
+    try {
+      const message = await Message.findById(messageId);
+      if (!message) return;
+
+      const reader = socket.user;
+      if (!reader) {
+        console.log(`[READ EVENT] No reader (socket.user missing)`);
+        return;
+      }
+
+      if (message.senderName.toLowerCase() === reader.toLowerCase()) {
+        console.log(`[READ EVENT] Reader ${reader} is sender; skipping.`);
+        return;
+      }
+
+      const chat = await Chat.findById(message.chatId);
+      if (!chat || (reader.toLowerCase() !== chat.sendName.toLowerCase() && reader.toLowerCase() !== chat.recName.toLowerCase())) {
+        console.log(`[READ EVENT] Reader ${reader} is not a member of chat ${message.chatId}`);
+        return;
+      }
+
+      if (!message.read) {
+        message.read = true;
+        message.readAt = new Date();
+        await message.save();
+        console.log(`[READ EVENT] Message marked as read`);
+
+const payload = {
+  messageId,
+  reader,
+  readAt: message.readAt,
+  chatId: message.chatId,
+};
+
+// Emit to sender
+const senderSocketId = globalUsers.get(message.senderName.toLowerCase());
+if (senderSocketId) {
+  io.to(senderSocketId).emit('message_read_ack', payload);
+}
+
+// Emit to reader too
+const readerSocketId = globalUsers.get(reader.toLowerCase());
+if (readerSocketId) {
+  io.to(readerSocketId).emit('message_read_ack', payload);
+}
+
+
+      }
+    } catch (err) {
+      console.error('Error updating read status:', err);
+    }
+  });
+
+  const heartbeatInterval = setInterval(() => {
+    socket.emit('ping');
+  }, 30000);
+
+  socket.on('pong', async () => {
+  if (socket.user) {
+    const user = await User.findOne({ name: new RegExp(`^${socket.user}$`, 'i') });
+    if (user && user.socketId === socket.id) {
+      if (user.lastOnline !== null) {
+        await User.updateOne({ name: user.name }, { lastOnline: null });
+        console.log(`[PONG] ${user.name} is still online (cleared lastOnline)`);
+      }
+    }
+  }
+});
+
+
+
+  socket.on('error', (err) => {
+    console.error('Socket error:', err);
+  });
+
+  socket.on('close', () => {
+    clearInterval(heartbeatInterval);
+  });
+
+  socket.on('manual_logout', async () => {
+    console.log('🔥 manual_logout received from:', socket.user);
+    if (!socket.user) return;
+
+    const username = socket.user.trim().toLowerCase();
+    const disconnectTime = new Date();
+
+    try {
+      const user = await User.findOne({ name: new RegExp(`^${username}$`, 'i') });
+      if (user && user.socketId === socket.id) {
+        await User.updateOne(
+          { name: user.name },
+          { lastOnline: disconnectTime, socketId: null }
+        );
+
+        io.emit('user_status', {
+          username: user.name,
+          isOnline: false,
+          lastOnline: disconnectTime,
+        });
+
+        console.log(`${user.name} logged out manually at ${disconnectTime}`);
+      }
+
+      globalUsers.delete(username);
+    } catch (err) {
+      console.error('manual_logout error:', err);
+    }
+
+    socket.disconnect(true);
+  });
+
+  
+});
+
+server.listen(PORT, '0.0.0.0');
+server.on('error', onError);
+server.on('listening', onListening);
+
+function onError(error) {
+  if (error.syscall !== 'listen') throw error;
+  const bind = typeof PORT === 'string' ? 'Pipe ' + PORT : 'Port ' + PORT;
+  switch (error.code) {
+    case 'EACCES':
+      console.error(bind + ' requires elevated privileges');
+      process.exit(1);
+    case 'EADDRINUSE':
+      console.error(bind + ' is already in use');
+      process.exit(1);
+    default:
+      throw error;
+  }
+}
+
+function onListening() {
+  const addr = server.address();
+  const bind = typeof addr === 'string' ? 'pipe ' + addr : 'port ' + addr.port;
+  debug('Listening on ' + bind);
+  console.log(`Socket.IO running on port ${PORT}`);
+}
